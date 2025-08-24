@@ -118,11 +118,28 @@ run_as_root() {
 find_build_user() {
     local build_user
     if [ "$(id -u)" -eq 0 ]; then
+        # Check for SUDO_USER first (from sudo)
+        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+            echo "$SUDO_USER"
+            return
+        fi
+        # Check for the user who called su (from $USER or logname)
+        if [ -n "$USER" ] && [ "$USER" != "root" ]; then
+            echo "$USER"
+            return
+        fi
+        # Try logname as fallback
+        if command -v logname >/dev/null 2>&1; then
+            build_user=$(logname 2>/dev/null || true)
+            if [ -n "$build_user" ] && [ "$build_user" != "root" ]; then
+                echo "$build_user"
+                return
+            fi
+        fi
+        # Find first regular user as final fallback
         build_user=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /nologin|false/ { print $1; exit }')
         if [ -n "$build_user" ]; then
             echo "$build_user"
-        elif [ -n "$SUDO_USER" ]; then
-            echo "$SUDO_USER"
         else
             echo "nobody"
         fi
@@ -269,7 +286,18 @@ build_and_install_package() {
     if [ "$CLEAN_BUILD" = "true" ] && [ -d "$temp_dir" ]; then
         rm -rf "$temp_dir"
     fi
-    mkdir -p "$temp_dir"
+    
+    # Create temp directory with proper ownership from the start
+    if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
+        local build_group=$(id -gn "$BUILD_USER" 2>/dev/null || echo "users")
+        mkdir -p "$temp_dir"
+        chown "$BUILD_USER:$build_group" "$temp_dir" 2>/dev/null || true
+        chmod 755 "$temp_dir" 2>/dev/null || true
+        # Also ensure parent directories are accessible
+        chmod 755 "$BUILD_DIR" 2>/dev/null || true
+    else
+        mkdir -p "$temp_dir"
+    fi
     cd "$temp_dir"
     
     cleanup_package() {
@@ -285,6 +313,13 @@ build_and_install_package() {
         log_error "Failed to clone repository for package '$package'"
         cleanup_package
         return 1
+    fi
+    
+    # Ensure all cloned files have correct ownership
+    if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
+        local build_group=$(id -gn "$BUILD_USER" 2>/dev/null || echo "users")
+        chown -R "$BUILD_USER:$build_group" "$temp_dir" 2>/dev/null || true
+        chmod -R u+w "$temp_dir" 2>/dev/null || true
     fi
     
     if [ "$SKIP_DEPS" != "true" ]; then
@@ -305,7 +340,12 @@ build_and_install_package() {
     
     local build_cmd
     if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
-        if command -v runuser >/dev/null 2>&1; then
+        # Ensure build user home directory exists and is accessible
+        local user_home=$(getent passwd "$BUILD_USER" | cut -d: -f6)
+        if [ -n "$user_home" ] && [ -d "$user_home" ]; then
+            # Use su with clean environment to run makepkg as the build user
+            build_cmd="su - $BUILD_USER -c 'cd \"$temp_dir\" && makepkg $makepkg_args'"
+        elif command -v runuser >/dev/null 2>&1; then
             build_cmd="runuser -u $BUILD_USER -- makepkg $makepkg_args"
         else
             build_cmd="makepkg $makepkg_args --asroot"
@@ -419,7 +459,15 @@ parse_arguments() {
 }
 
 main() {
-    mkdir -p "$BUILD_DIR"
+    # Create build directory with proper permissions
+    if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
+        mkdir -p "$BUILD_DIR"
+        local build_group=$(id -gn "$BUILD_USER" 2>/dev/null || echo "users")
+        chown "$BUILD_USER:$build_group" "$BUILD_DIR" 2>/dev/null || true
+        chmod 755 "$BUILD_DIR" 2>/dev/null || true
+    else
+        mkdir -p "$BUILD_DIR"
+    fi
     
     parse_arguments "$@"
     
