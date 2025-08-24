@@ -2,15 +2,12 @@
 
 set -e
 
-# Script version
 SCRIPT_VERSION="1.0.0"
 SCRIPT_NAME="take"
 
-# Configuration
 AUR_BASE_URL="https://aur.archlinux.org"
 BUILD_DIR="${BUILD_DIR:-/tmp/aur-build-$$}"
 
-# Colors for output
 if [ -t 1 ]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -19,12 +16,11 @@ if [ -t 1 ]; then
     PURPLE='\033[0;35m'
     CYAN='\033[0;36m'
     BOLD='\033[1m'
-    NC='\033[0m' # No Color
+    NC='\033[0m'
 else
     RED='' GREEN='' YELLOW='' BLUE='' PURPLE='' CYAN='' BOLD='' NC=''
 fi
 
-# Default options
 CLEAN_BUILD=false
 SKIP_DEPS=true
 FORCE_INSTALL=false
@@ -34,10 +30,9 @@ QUIET=false
 VERBOSE=false
 FAST_MODE=true
 
-# Usage information
 show_usage() {
     cat << EOF
-$SCRIPT_NAME $SCRIPT_VERSION -
+$SCRIPT_NAME $SCRIPT_VERSION
 
 USAGE:
     $SCRIPT_NAME [OPTIONS] <packages...>
@@ -65,7 +60,6 @@ EXAMPLES:
 EOF
 }
 
-# Logging functions
 log_info() {
     if [ "$QUIET" != "true" ]; then
         printf "${BLUE}::${NC} %s\n" "$1"
@@ -92,7 +86,6 @@ log_debug() {
     fi
 }
 
-# Detect privilege escalation method
 detect_privilege_escalation() {
     if command -v doas >/dev/null 2>&1; then
         echo "doas"
@@ -107,7 +100,6 @@ detect_privilege_escalation() {
 PRIV_ESC=$(detect_privilege_escalation)
 log_debug "Using privilege escalation: $PRIV_ESC"
 
-# Wrapper for privilege escalation
 run_as_root() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -123,11 +115,9 @@ run_as_root() {
     fi
 }
 
-# Find suitable build user
 find_build_user() {
     local build_user
     if [ "$(id -u)" -eq 0 ]; then
-        # Running as root, find a regular user
         build_user=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /nologin|false/ { print $1; exit }')
         if [ -n "$build_user" ]; then
             echo "$build_user"
@@ -144,10 +134,14 @@ find_build_user() {
 BUILD_USER=$(find_build_user)
 log_debug "Build user: $BUILD_USER"
 
-# Search AUR packages
+url_encode() {
+    printf '%s\n' "$1" | sed 's/ /%20/g;s/+/%2B/g;s/&/%26/g'
+}
+
 search_aur() {
     local query="$1"
-    local url="https://aur.archlinux.org/rpc/?v=5&type=search&arg=$query"
+    local encoded_query=$(url_encode "$query")
+    local url="https://aur.archlinux.org/rpc/?v=5&type=search&arg=$encoded_query"
     
     log_info "Searching AUR for: $query"
     local results=$(curl -s "$url")
@@ -167,10 +161,10 @@ search_aur() {
     fi
 }
 
-# Show package info
 show_package_info() {
     local package="$1"
-    local url="https://aur.archlinux.org/rpc/?v=5&type=info&arg=$package"
+    local encoded_package=$(url_encode "$package")
+    local url="https://aur.archlinux.org/rpc/?v=5&type=info&arg=$encoded_package"
     
     local info=$(curl -s "$url")
     
@@ -201,51 +195,112 @@ show_package_info() {
     fi
 }
 
-# Build and install package
+package_exists_in_aur() {
+    local package="$1"
+    local encoded_package=$(url_encode "$package")
+    local url="https://aur.archlinux.org/rpc/?v=5&type=info&arg=$encoded_package"
+    
+    local info=$(curl -s "$url" 2>/dev/null)
+    echo "$info" | grep -q '"resultcount":1'
+}
+
+get_aur_dependencies() {
+    local package="$1"
+    local encoded_package=$(url_encode "$package")
+    local url="https://aur.archlinux.org/rpc/?v=5&type=info&arg=$encoded_package"
+    
+    local info=$(curl -s "$url" 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+        echo "$info" | jq -r '.results[0].Depends[]? // empty, .results[0].MakeDepends[]? // empty' 2>/dev/null | \
+        sed 's/[<>=].*//' | sort -u
+    else
+        echo "$info" | sed -n 's/.*"Depends":\[\([^]]*\)\].*/\1/p;s/.*"MakeDepends":\[\([^]]*\)\].*/\1/p' | \
+        tr ',' '\n' | sed 's/"//g;s/[<>=].*//;/^$/d' | sort -u
+    fi
+}
+
+install_dependencies() {
+    local package="$1"
+    local deps=$(get_aur_dependencies "$package")
+    
+    if [ -z "$deps" ]; then
+        return 0
+    fi
+    
+    local repo_deps=""
+    local aur_deps=""
+    
+    for dep in $deps; do
+        if pacman -Si "$dep" >/dev/null 2>&1; then
+            repo_deps="$repo_deps $dep"
+        elif package_exists_in_aur "$dep"; then
+            aur_deps="$aur_deps $dep"
+        fi
+    done
+    
+    if [ -n "$repo_deps" ]; then
+        log_info "Installing repository dependencies:$repo_deps"
+        if ! run_as_root pacman -S --noconfirm --needed --asdeps $repo_deps; then
+            log_warning "Failed to install some repository dependencies"
+        fi
+    fi
+    
+    if [ -n "$aur_deps" ]; then
+        log_info "Installing AUR dependencies:$aur_deps"
+        for aur_dep in $aur_deps; do
+            if ! build_and_install_package "$aur_dep"; then
+                log_warning "Failed to install AUR dependency: $aur_dep"
+            fi
+        done
+    fi
+}
+
 build_and_install_package() {
     local package="$1"
     local temp_dir="$BUILD_DIR/$package"
     
     log_info "Processing package: $package"
     
-    # Setup build directory
+    if ! package_exists_in_aur "$package"; then
+        log_error "Package '$package' not found in AUR"
+        return 1
+    fi
+    
     if [ "$CLEAN_BUILD" = "true" ] && [ -d "$temp_dir" ]; then
         rm -rf "$temp_dir"
     fi
     mkdir -p "$temp_dir"
     cd "$temp_dir"
     
-    # Cleanup function
     cleanup_package() {
         if [ -d "$temp_dir" ]; then
             rm -rf "$temp_dir" 2>/dev/null || true
         fi
     }
     
-    # Clone AUR repository
     log_info "Cloning AUR repository for $package..."
     local aur_url="$AUR_BASE_URL/${package}.git"
     
     if ! git clone --depth=1 "$aur_url" . 2>/dev/null; then
-        log_error "Package '$package' not found in AUR"
+        log_error "Failed to clone repository for package '$package'"
         cleanup_package
         return 1
     fi
     
-    # Set proper ownership if running as root
+    if [ "$SKIP_DEPS" != "true" ]; then
+        install_dependencies "$package"
+    fi
+    
     if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
         chown -R "$BUILD_USER:$(id -gn "$BUILD_USER")" "$temp_dir" 2>/dev/null || true
     fi
     
-    # Build package with speed optimizations but proper dependency handling
     log_info "Building package $package..."
     
-    # Keep speed flags but allow dependency resolution
-    local makepkg_args="--noconfirm --needed --skipinteg --nocheck"
+    local makepkg_args="--noconfirm --needed"
     
-    # Only skip PGP checks if we're in fast mode
     if [ "$FAST_MODE" = "true" ]; then
-        makepkg_args="$makepkg_args --skippgpcheck"
+        makepkg_args="$makepkg_args --skipinteg --nocheck --skippgpcheck"
     fi
     
     local build_cmd
@@ -261,7 +316,6 @@ build_and_install_package() {
     
     log_debug "Build command: $build_cmd"
     
-    # Don't suppress output if verbose mode or if build fails
     if [ "$VERBOSE" = "true" ]; then
         if ! eval "$build_cmd"; then
             log_error "Failed to build package $package"
@@ -277,7 +331,6 @@ build_and_install_package() {
         fi
     fi
     
-    # Find and install built package
     local package_file=$(find . -name "*.pkg.tar.*" -type f | head -1)
     
     if [ -z "$package_file" ]; then
@@ -288,7 +341,6 @@ build_and_install_package() {
     
     log_info "Installing package $package..."
     
-    # Install with proper flags
     local pacman_args="--noconfirm --needed"
     if [ "$FORCE_INSTALL" = "true" ]; then
         pacman_args="$pacman_args --force"
@@ -305,12 +357,10 @@ build_and_install_package() {
     return 0
 }
 
-# Parse command line arguments
 parse_arguments() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -S|--sync)
-                # Default mode, nothing to change
                 shift
                 ;;
             -Ss|--search)
@@ -365,19 +415,14 @@ parse_arguments() {
         esac
     done
     
-    # Remaining arguments are packages
     PACKAGES="$*"
 }
 
-# Main function
 main() {
-    # Create necessary directories
     mkdir -p "$BUILD_DIR"
     
-    # Parse arguments
     parse_arguments "$@"
     
-    # Handle different modes
     if [ "$SEARCH_MODE" = "true" ]; then
         for query in $PACKAGES; do
             search_aur "$query"
@@ -393,7 +438,6 @@ main() {
         exit 0
     fi
     
-    # Install mode (default)
     if [ -z "$PACKAGES" ]; then
         log_error "No packages specified"
         show_usage
@@ -404,7 +448,6 @@ main() {
     local failed_packages=""
     local package_count=0
     
-    # Count packages
     for package in $PACKAGES; do
         package_count=$((package_count + 1))
     done
@@ -419,7 +462,6 @@ main() {
         fi
     done
     
-    # Summary
     if [ -n "$successful_packages" ]; then
         log_success "Successfully installed:$successful_packages"
     fi
@@ -432,7 +474,6 @@ main() {
     log_success "All packages installed successfully!"
 }
 
-# Check dependencies (minimal)
 check_dependencies() {
     if [ "$FAST_MODE" = "true" ]; then
         return 0
@@ -440,7 +481,6 @@ check_dependencies() {
     
     local missing_deps=""
     
-    # Only check critical commands
     if ! command -v git >/dev/null 2>&1; then
         missing_deps="$missing_deps git"
     fi
@@ -452,7 +492,6 @@ check_dependencies() {
     fi
 }
 
-# Initialize
 if [ "${0##*/}" = "take" ]; then
     check_dependencies
     main "$@"
