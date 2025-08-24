@@ -37,7 +37,7 @@ FAST_MODE=true
 # Usage information
 show_usage() {
     cat << EOF
-$SCRIPT_NAME $SCRIPT_VERSION - Enhanced AUR Helper
+$SCRIPT_NAME $SCRIPT_VERSION -
 
 USAGE:
     $SCRIPT_NAME [OPTIONS] <packages...>
@@ -201,7 +201,7 @@ show_package_info() {
     fi
 }
 
-# Build and install package (fast mode)
+# Build and install package
 build_and_install_package() {
     local package="$1"
     local temp_dir="$BUILD_DIR/$package"
@@ -232,16 +232,21 @@ build_and_install_package() {
         return 1
     fi
     
-    # Set proper ownership if running as root (fast)
+    # Set proper ownership if running as root
     if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
         chown -R "$BUILD_USER:$(id -gn "$BUILD_USER")" "$temp_dir" 2>/dev/null || true
     fi
     
-    # Build package (minimal flags for speed)
+    # Build package with speed optimizations but proper dependency handling
     log_info "Building package $package..."
     
-    # Use minimal makepkg args for maximum speed
-    local makepkg_args="--noconfirm --skippgpcheck --skipinteg --nodeps --nocheck"
+    # Keep speed flags but allow dependency resolution
+    local makepkg_args="--noconfirm --needed --skipinteg --nocheck"
+    
+    # Only skip PGP checks if we're in fast mode
+    if [ "$FAST_MODE" = "true" ]; then
+        makepkg_args="$makepkg_args --skippgpcheck"
+    fi
     
     local build_cmd
     if [ "$(id -u)" -eq 0 ] && [ "$BUILD_USER" != "root" ]; then
@@ -254,10 +259,22 @@ build_and_install_package() {
         build_cmd="makepkg $makepkg_args"
     fi
     
-    if ! eval "$build_cmd" 2>/dev/null; then
-        log_error "Failed to build package $package"
-        cleanup_package
-        return 1
+    log_debug "Build command: $build_cmd"
+    
+    # Don't suppress output if verbose mode or if build fails
+    if [ "$VERBOSE" = "true" ]; then
+        if ! eval "$build_cmd"; then
+            log_error "Failed to build package $package"
+            cleanup_package
+            return 1
+        fi
+    else
+        if ! eval "$build_cmd" >/dev/null 2>&1; then
+            log_error "Failed to build package $package"
+            log_info "Try running with -v for more verbose output"
+            cleanup_package
+            return 1
+        fi
     fi
     
     # Find and install built package
@@ -271,7 +288,13 @@ build_and_install_package() {
     
     log_info "Installing package $package..."
     
-    if ! run_as_root pacman -U --noconfirm "$package_file" 2>/dev/null; then
+    # Install with proper flags
+    local pacman_args="--noconfirm --needed"
+    if [ "$FORCE_INSTALL" = "true" ]; then
+        pacman_args="$pacman_args --force"
+    fi
+    
+    if ! run_as_root pacman -U $pacman_args "$package_file"; then
         log_error "Failed to install package $package"
         cleanup_package
         return 1
